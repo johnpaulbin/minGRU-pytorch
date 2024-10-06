@@ -15,9 +15,6 @@ import sentencepiece as spm
 
 from minGRU_pytorch.minGRULM import minGRULM
 
-import torch
-from torch.utils.data import Dataset, DataLoader
-
 class TokenizedTextDataset(Dataset):
     def __init__(self, data_file, seq_len):
         self.data_file = data_file
@@ -148,8 +145,8 @@ def main(rank, world_size, train_data_file, val_data_file, args):
             noise = torch.zeros_like(t).uniform_(0, 1)
             return -log(-log(noise))
 
-        def gumbel_sample(t, temperature=1.0, dim=-1):
-            return ((t / max(temperature, 1e-10)) + gumbel_noise(t)).argmax(dim=dim)
+        def gumbel_sample(t, temperature = 1., dim = -1, keepdim = True):
+            return ((t / max(temperature, 1e-10)) + gumbel_noise(t)).argmax(dim = dim, keepdim = keepdim)
 
         def top_k(logits, thres=0.9):
             k = max(1, int((1 - thres) * logits.shape[-1]))
@@ -162,22 +159,24 @@ def main(rank, world_size, train_data_file, val_data_file, args):
             net,
             prompt: Tensor,
             seq_len: int,
-            temperature=1.0,
-            filter_thres=0.9,
+            temperature = 1.,
+            filter_thres = 0.9,
         ):
             prompt_seq_len, out = prompt.shape[-1], prompt.clone()
             sample_num_times = max(0, seq_len - prompt_seq_len)
 
+            prev_hiddens = None
+
             for _ in range(sample_num_times):
-                logits = net(out)
+                logits, prev_hiddens = net(out, return_prev_hiddens = True)
                 logits = logits[:, -1]
 
-                logits = top_k(logits, thres=filter_thres)
-                sample = gumbel_sample(logits, temperature=temperature, dim=-1)
+                logits = top_k(logits, thres = filter_thres)
+                sample = gumbel_sample(logits, temperature = temperature, dim = -1)
 
-                out = torch.cat((out, sample[..., None]), dim=-1)
+                out = torch.cat((out, sample), dim = -1)
 
-            return out[..., :]
+            return out[..., prompt_seq_len:]
 
         def decode_tokens(token_ids):
             return sp.decode(token_ids)
@@ -188,7 +187,9 @@ def main(rank, world_size, train_data_file, val_data_file, args):
                 train_sampler.set_epoch(epoch)  # For shuffling with DistributedSampler
 
             if rank == 0:
-                print(f"Starting epoch {epoch + 1}/{NUM_EPOCHS}")
+                # Calculate the number of steps in this epoch
+                steps_in_epoch = len(train_loader)
+                print(f"Starting epoch {epoch + 1}/{NUM_EPOCHS}, which has {steps_in_epoch} steps.")
 
             for batch_idx, data in enumerate(train_loader):
                 step = start_step + batch_idx
@@ -242,6 +243,8 @@ def main(rank, world_size, train_data_file, val_data_file, args):
                             base_decode_output = decode_tokens(sampled_ids)
 
                             print(f"Generated text:\n{base_decode_output}\n")
+                        
+                            
                         model.train()
 
                     # Checkpointing
@@ -257,6 +260,7 @@ def main(rank, world_size, train_data_file, val_data_file, args):
                         torch.save(checkpoint, checkpoint_filename)
                         print(f"Checkpoint saved at step {step} to {checkpoint_filename}")
 
+            # Update the starting step after each epoch
             start_step += len(train_loader)
 
         # Final Checkpoint after training
@@ -287,7 +291,7 @@ def main(rank, world_size, train_data_file, val_data_file, args):
 if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description='Train minGRULM with checkpointing and multiple epochs.')
+    parser = argparse.ArgumentParser(description='Train minGRULM with checkpointing, multiple epochs, and dynamic data files.')
 
     # Training hyperparameters
     parser.add_argument('--num_epochs', type=int, default=10, help='Number of epochs to train for.')
@@ -298,7 +302,7 @@ if __name__ == '__main__':
     parser.add_argument('--generate_every', type=int, default=300, help='Generate text every n steps.')
     parser.add_argument('--checkpoint_every', type=int, default=1000, help='Save checkpoint every n steps.')
     parser.add_argument('--checkpoint_path', type=str, default='', help='Path to checkpoint to resume training.')
-    
+
     # New arguments for data files
     parser.add_argument('--train_data', type=str, default='train_data.npy', help='Path to training data file.')
     parser.add_argument('--val_data', type=str, default='val_data.npy', help='Path to validation data file.')
